@@ -1,6 +1,7 @@
 import base64
 import json
 
+
 def convert_cookies_to_base64():
     try:
         with open("cookies.json", "r") as f:

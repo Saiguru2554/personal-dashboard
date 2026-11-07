@@ -132,7 +132,6 @@ def run_scraper():
     genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
     with sync_playwright() as p:
-        # Launch Chromium with anti-detection flags
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -142,7 +141,6 @@ def run_scraper():
             ]
         )
         
-        # Create browser context using sanitized storage state and real desktop user agent
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1440, "height": 900},
@@ -150,8 +148,6 @@ def run_scraper():
         )
         
         page = context.new_page()
-        
-        # Mask navigator.webdriver flag against automated bot detection
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         collected_jobs = []
@@ -163,12 +159,12 @@ def run_scraper():
             print(f"\n--- Scraping [{category}]: {target_url} ---")
 
             try:
-                # Navigate to URL and wait for DOM tree creation
                 page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                 
                 # Detect forced auth walls (e.g. LinkedIn guest block)
                 if "authwall" in page.url.lower():
-                    print(f"⚠️ Hit anti-bot authwall at {target_url}. Skipping URL.")
+                    print(f"⚠️ Hit anti-bot authwall at {target_url}.")
+                    send_insights(target_url, "⚠️ Authwall encountered. Refresh session cookies.")
                     continue
 
                 # Incremental scroll loop to trigger infinite load / AJAX hydration
@@ -176,17 +172,18 @@ def run_scraper():
                     page.mouse.wheel(0, 1000)
                     page.wait_for_timeout(1000)
 
-                # Extract plain text content from the DOM body
                 body_text = page.inner_text("body")
-                clean_text = " ".join(body_text.split())[:20000] # Truncate to safe context size
+                clean_text = " ".join(body_text.split())[:20000]
                 print(f"Extracted {len(clean_text)} characters of DOM content.")
 
                 if not genai_client:
                     print("⚠️ GEMINI_API_KEY missing. Skipping AI processing.")
+                    send_insights(target_url, "⚠️ Target scraped, but GEMINI_API_KEY is missing for AI digest.")
                     continue
 
                 if category == "JOBS":
-                    prompt = """
+                    # 1. Extract job cards for Matched Tech Jobs widget
+                    job_prompt = """
                     You are an expert tech recruiter matching job openings.
                     Analyze this raw text extracted from a job search portal and extract up to 5 relevant engineering/tech job listings.
                     Return ONLY a valid JSON array of objects with no markdown formatting or commentary:
@@ -202,7 +199,7 @@ def run_scraper():
                     """
                     response = genai_client.models.generate_content(
                         model='gemini-1.5-flash',
-                        contents=[prompt + "\n\nDOM Text:\n" + clean_text]
+                        contents=[job_prompt + "\n\nDOM Text:\n" + clean_text]
                     )
                     
                     raw_response = response.text or ""
@@ -211,7 +208,6 @@ def run_scraper():
                     try:
                         jobs = json.loads(cleaned_json)
                         if isinstance(jobs, list):
-                            # Set fallback URL if applyUrl missing
                             for j in jobs:
                                 if not j.get("applyUrl"):
                                     j["applyUrl"] = target_url
@@ -220,8 +216,20 @@ def run_scraper():
                     except Exception as parse_err:
                         print(f"⚠️ JSON Parsing Error on {target_url}: {parse_err}")
 
+                    # 2. ALSO generate & post an executive digest for AI Agent Insights widget
+                    insight_prompt = """
+                    Summarize the top hiring trends, salary ranges, or active tech role types from this job listing text in 2 concise bullet points.
+                    Return plain text only.
+                    """
+                    digest_resp = genai_client.models.generate_content(
+                        model='gemini-1.5-flash',
+                        contents=[insight_prompt + "\n\nDOM Text:\n" + clean_text]
+                    )
+                    job_digest = (digest_resp.text or "Job listings extracted successfully.").strip()
+                    send_insights(target_url, job_digest)
+
                 else:
-                    # Default: TECH / Events category
+                    # TECH / Events category
                     prompt = """
                     Summarize the top 3 tech updates, key events, or hiring trends from this text in 2 concise, executive bullet points.
                     Return plain text only.
@@ -235,15 +243,14 @@ def run_scraper():
 
             except Exception as e:
                 print(f" Error scraping target {target_url}: {e}")
+                send_insights(target_url, f"⚠️ Error during execution: {str(e)[:100]}")
                 continue
 
         browser.close()
 
-        # Clean up temporary sanitized session file
         if session_file and os.path.exists(session_file):
             os.remove(session_file)
 
-        # Batch push all extracted jobs back to dashboard
         if collected_jobs:
             send_jobs(collected_jobs)
 
