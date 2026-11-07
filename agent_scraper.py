@@ -1,62 +1,135 @@
+"""
+AI Scraper Agent - Playwright & Google GenAI Engine
+Fetches target URLs from Apps Script Webhook, restores authenticated browser sessions,
+scrapes dynamic DOM content, extracts structured job/tech insights via Gemini,
+and posts results back to the Personal Command Center dashboard.
+"""
+
 import base64
 import json
 import os
 import sys
+import time
 
 import requests
 from google import genai
 from playwright.sync_api import sync_playwright
 
+# Environment Variables fetched from GitHub Secrets
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 APPS_SCRIPT_WEBHOOK = os.environ.get("APPS_SCRIPT_WEBHOOK")
 SESSION_BASE64 = os.environ.get("SESSION_STATE_BASE64")
 
+
+def sanitize_storage_state(state):
+    """
+    Sanitizes exported cookie sameSite attributes to conform strictly
+    to Playwright's required schema ('Strict' | 'Lax' | 'None').
+    """
+    if not isinstance(state, dict):
+        return state
+
+    cookies = state.get("cookies", [])
+    for cookie in cookies:
+        raw_same_site = str(cookie.get("sameSite", "")).lower().strip()
+        
+        if raw_same_site == "strict":
+            cookie["sameSite"] = "Strict"
+        elif raw_same_site == "lax":
+            cookie["sameSite"] = "Lax"
+        elif raw_same_site in ["none", "no_restriction"]:
+            cookie["sameSite"] = "None"
+        else:
+            cookie["sameSite"] = "Lax"  # Safe default fallback for null/unspecified
+
+    return state
+
+
 def restore_session():
-    if SESSION_BASE64:
-        try:
-            with open("state.json", "wb") as f:
-                f.write(base64.b64decode(SESSION_BASE64))
-            return "state.json"
-        except Exception as e:
-            print(f"Error restoring session: {e}")
-    return None
+    """
+    Decodes the Base64 session string, sanitizes cookies, and writes a temporary
+    Playwright-compatible 'sanitized_state.json' file.
+    """
+    if not SESSION_BASE64:
+        print("No SESSION_STATE_BASE64 secret provided. Running in guest mode.")
+        return None
+
+    try:
+        decoded_bytes = base64.b64decode(SESSION_BASE64)
+        raw_state = json.loads(decoded_bytes.decode('utf-8'))
+        
+        # Sanitize cookie values to prevent Playwright schema crashes
+        clean_state = sanitize_storage_state(raw_state)
+        
+        file_path = "sanitized_state.json"
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(clean_state, f, indent=2)
+            
+        print(" Successfully restored and sanitized authenticated session state.")
+        return file_path
+    except Exception as e:
+        print(f"⚠️ Error restoring session state: {e}. Falling back to unauthenticated session.")
+        return None
+
 
 def fetch_dynamic_config():
+    """Fetches active scraping targets configured in Google Apps Script."""
     try:
         url = f"{APPS_SCRIPT_WEBHOOK}?action=getConfig"
-        print(f"Fetching scraping targets from: {url}")
+        print(f"Fetching active scraping targets from: {url}")
         response = requests.get(url, timeout=20)
+        
         if response.status_code == 200:
             config = response.json()
-            print(f"Active targets loaded ({len(config)}): {config}")
+            print(f" Loaded {len(config)} active target(s) from backend.")
             return config
-        return []
+        else:
+            print(f"⚠️ Backend returned HTTP status: {response.status_code}")
+            return []
     except Exception as e:
-        print(f"Error fetching target config: {e}")
+        print(f" Error fetching target config: {e}")
         return []
+
 
 def send_jobs(jobs_list):
-    payload = {"action": "addJobs", "jobs": jobs_list}
-    r = requests.post(APPS_SCRIPT_WEBHOOK, json=payload, timeout=20)
-    print(f"Pushed {len(jobs_list)} jobs to dashboard: Status {r.status_code}")
+    """POSTs scraped job listings back to Apps Script webhook."""
+    if not jobs_list:
+        return
+    try:
+        payload = {"action": "addJobs", "jobs": jobs_list}
+        r = requests.post(APPS_SCRIPT_WEBHOOK, json=payload, timeout=20)
+        print(f" Pushed {len(jobs_list)} job(s) to dashboard DB (Status: {r.status_code}).")
+    except Exception as e:
+        print(f" Error pushing jobs to dashboard: {e}")
+
 
 def send_insights(target_url, summary):
-    payload = {"action": "addInsights", "url": target_url, "summary": summary}
-    r = requests.post(APPS_SCRIPT_WEBHOOK, json=payload, timeout=20)
-    print(f"Pushed insight for {target_url}: Status {r.status_code}")
+    """POSTs web intelligence/event summaries back to Apps Script webhook."""
+    if not summary:
+        return
+    try:
+        payload = {"action": "addInsights", "url": target_url, "summary": summary}
+        r = requests.post(APPS_SCRIPT_WEBHOOK, json=payload, timeout=20)
+        print(f" Pushed insight digest for {target_url} (Status: {r.status_code}).")
+    except Exception as e:
+        print(f" Error pushing insights for {target_url}: {e}")
+
 
 def run_scraper():
+    """Main execution workflow for headless browser scraping & AI processing."""
     if not APPS_SCRIPT_WEBHOOK:
-        print("ERROR: APPS_SCRIPT_WEBHOOK is missing.")
+        print("❌ CRITICAL ERROR: APPS_SCRIPT_WEBHOOK environment variable is missing.")
         sys.exit(1)
 
     active_targets = fetch_dynamic_config()
     if not active_targets:
-        print("No active scraping targets returned from Apps Script backend.")
+        print("No active targets found. Exiting runner execution.")
         return
 
     session_file = restore_session()
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    # Initialize Gemini client using official Google GenAI SDK
+    genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
     with sync_playwright() as p:
         # Launch Chromium with anti-detection flags
@@ -69,16 +142,16 @@ def run_scraper():
             ]
         )
         
-        # Set real desktop browser viewport and User-Agent
+        # Create browser context using sanitized storage state and real desktop user agent
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1440, "height": 900},
             storage_state=session_file if session_file else None
         )
         
         page = context.new_page()
         
-        # Hide navigator.webdriver flag from anti-bot detectors
+        # Mask navigator.webdriver flag against automated bot detection
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         collected_jobs = []
@@ -87,69 +160,93 @@ def run_scraper():
             target_url = target.get("url")
             category = target.get("category", "TECH").upper()
 
-            print(f"\n Scraped Target [{category}]: {target_url}")
+            print(f"\n--- Scraping [{category}]: {target_url} ---")
 
             try:
-                # Navigate and wait for DOM load
+                # Navigate to URL and wait for DOM tree creation
                 page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                 
-                # Check for forced auth wall redirect
-                current_url = page.url.lower()
-                if "authwall" in current_url:
-                    print(f"⚠️ Hit anti-bot authwall on {target_url}. Skipping.")
+                # Detect forced auth walls (e.g. LinkedIn guest block)
+                if "authwall" in page.url.lower():
+                    print(f"⚠️ Hit anti-bot authwall at {target_url}. Skipping URL.")
                     continue
 
-                # Scroll down to trigger client-side rendering for SPAs
-                page.evaluate("window.scrollBy(0, 800)")
-                page.wait_for_timeout(4000)  # Wait 4s for React/Next.js hydration
+                # Incremental scroll loop to trigger infinite load / AJAX hydration
+                for _ in range(4):
+                    page.mouse.wheel(0, 1000)
+                    page.wait_for_timeout(1000)
 
-                page_text = page.inner_text("body")[:15000]
-                print(f"Extracted {len(page_text)} chars of text content.")
+                # Extract plain text content from the DOM body
+                body_text = page.inner_text("body")
+                clean_text = " ".join(body_text.split())[:20000] # Truncate to safe context size
+                print(f"Extracted {len(clean_text)} characters of DOM content.")
+
+                if not genai_client:
+                    print("⚠️ GEMINI_API_KEY missing. Skipping AI processing.")
+                    continue
 
                 if category == "JOBS":
                     prompt = """
-                    You are a tech recruiter matching software engineering / AI / IoT job openings.
-                    Extract up to 3 relevant matching job openings from this raw webpage text.
-                    Return ONLY a raw JSON array of objects:
+                    You are an expert tech recruiter matching job openings.
+                    Analyze this raw text extracted from a job search portal and extract up to 5 relevant engineering/tech job listings.
+                    Return ONLY a valid JSON array of objects with no markdown formatting or commentary:
                     [
                       {
                         "role": "Job Title",
                         "company": "Company Name",
-                        "location": "Location / Remote",
-                        "techStack": "Matched Tech Stack",
-                        "applyUrl": "Direct Apply URL or Page URL"
+                        "location": "Location or Remote/Hybrid",
+                        "techStack": "Required Skills / Tech Stack",
+                        "applyUrl": "Direct Apply Link or Page URL"
                       }
                     ]
                     """
-                    response = client.models.generate_content(
+                    response = genai_client.models.generate_content(
                         model='gemini-1.5-flash',
-                        contents=[prompt + "\n\nDOM Text:\n" + page_text]
+                        contents=[prompt + "\n\nDOM Text:\n" + clean_text]
                     )
-                    cleaned = response.text.replace("```json", "").replace("```", "").strip()
+                    
+                    raw_response = response.text or ""
+                    cleaned_json = raw_response.replace("```json", "").replace("```", "").strip()
+                    
                     try:
-                        jobs = json.loads(cleaned)
-                        collected_jobs.extend(jobs)
-                        print(f" Extracted {len(jobs)} jobs from {target_url}")
+                        jobs = json.loads(cleaned_json)
+                        if isinstance(jobs, list):
+                            # Set fallback URL if applyUrl missing
+                            for j in jobs:
+                                if not j.get("applyUrl"):
+                                    j["applyUrl"] = target_url
+                            collected_jobs.extend(jobs)
+                            print(f" Extracted {len(jobs)} jobs from {target_url}")
                     except Exception as parse_err:
-                        print(f"JSON Parse Error on {target_url}: {parse_err}")
+                        print(f"⚠️ JSON Parsing Error on {target_url}: {parse_err}")
 
                 else:
-                    prompt = "Summarize the top 3 tech updates or key insights from this page into 2 short bullet points."
-                    response = client.models.generate_content(
+                    # Default: TECH / Events category
+                    prompt = """
+                    Summarize the top 3 tech updates, key events, or hiring trends from this text in 2 concise, executive bullet points.
+                    Return plain text only.
+                    """
+                    response = genai_client.models.generate_content(
                         model='gemini-1.5-flash',
-                        contents=[prompt + "\n\nDOM Text:\n" + page_text]
+                        contents=[prompt + "\n\nDOM Text:\n" + clean_text]
                     )
-                    summary = response.text.strip()
+                    summary = (response.text or "No summary generated.").strip()
                     send_insights(target_url, summary)
 
             except Exception as e:
-                print(f" Error scraping {target_url}: {e}")
+                print(f" Error scraping target {target_url}: {e}")
                 continue
 
         browser.close()
 
+        # Clean up temporary sanitized session file
+        if session_file and os.path.exists(session_file):
+            os.remove(session_file)
+
+        # Batch push all extracted jobs back to dashboard
         if collected_jobs:
             send_jobs(collected_jobs)
+
 
 if __name__ == "__main__":
     run_scraper()
