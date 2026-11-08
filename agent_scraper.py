@@ -1,7 +1,7 @@
 """
-AI Scraper Agent - Playwright & Google GenAI Engine
+AI Scraper Agent - Playwright & Direct REST API Engine
 Fetches target URLs from Apps Script Webhook, restores authenticated browser sessions,
-scrapes dynamic DOM content, extracts structured job/tech insights via Gemini,
+scrapes dynamic DOM content, extracts structured job/tech insights via Gemini REST API,
 and posts results back to the Personal Command Center dashboard.
 """
 
@@ -10,52 +10,64 @@ import json
 import os
 import sys
 import time
+
 import requests
-from google import genai
-from google.genai.types import HttpOptions
 from playwright.sync_api import sync_playwright
 
 # Environment Variables fetched from GitHub Secrets
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 APPS_SCRIPT_WEBHOOK = os.environ.get("APPS_SCRIPT_WEBHOOK")
 SESSION_BASE64 = os.environ.get("SESSION_STATE_BASE64")
-GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL")
 
 
-def generate_content_safe(client, contents):
+def generate_content_safe(contents):
     """
-    Tries models against the stable v1 API endpoint to prevent v1beta 404 NOT_FOUND errors.
+    Direct REST API call to Google's Gemini endpoint.
+    Bypasses SDK wrapper issues by executing raw HTTP POST requests.
     """
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable is missing.")
+
+    prompt_text = contents[0] if isinstance(contents, list) else contents
     models_to_try = [
-        GEMINI_MODEL_ENV,
         "gemini-2.5-flash",
-        "models/gemini-2.5-flash",
         "gemini-2.0-flash",
-        "models/gemini-2.0-flash"
+        "gemini-1.5-flash"
     ]
-    
-    seen = set()
-    models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
 
     attempt_errors = []
-    for model_name in models:
+
+    for model_name in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt_text}]
+            }]
+        }
+
         try:
-            print(f" Attempting generation with model: '{model_name}'...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents
-            )
-            if response and response.text:
-                print(f" Successfully generated content using model: '{model_name}'")
-                return response.text
+            print(f" Attempting REST API call for model: '{model_name}'...")
+            res = requests.post(url, json=payload, headers=headers, timeout=30)
+            
+            if res.status_code == 200:
+                data = res.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                if text:
+                    print(f" Successfully generated content via REST API using: '{model_name}'")
+                    return text
+            else:
+                err_msg = f"Model '{model_name}' HTTP {res.status_code}: {res.text[:150]}"
+                print(f"⚠️ {err_msg}")
+                attempt_errors.append(err_msg)
         except Exception as e:
-            err_msg = f"Model '{model_name}' failed: {e}"
+            err_msg = f"Model '{model_name}' request error: {e}"
             print(f"⚠️ {err_msg}")
             attempt_errors.append(err_msg)
             continue
 
     all_err_summary = " | ".join(attempt_errors[:2])
-    raise RuntimeError(f"All models failed ({all_err_summary})")
+    raise RuntimeError(f"All REST model attempts failed ({all_err_summary})")
 
 
 def sanitize_storage_state(state):
@@ -162,14 +174,6 @@ def run_scraper():
         return
 
     session_file = restore_session()
-    
-    # Force the client to use the stable 'v1' REST endpoint instead of 'v1beta'
-    genai_client = None
-    if GEMINI_API_KEY:
-        genai_client = genai.Client(
-            api_key=GEMINI_API_KEY,
-            http_options=HttpOptions(api_version="v1")
-        )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -214,7 +218,7 @@ def run_scraper():
                 clean_text = " ".join(body_text.split())[:20000]
                 print(f"Extracted {len(clean_text)} characters of DOM content.")
 
-                if not genai_client:
+                if not GEMINI_API_KEY:
                     print("⚠️ GEMINI_API_KEY missing. Skipping AI processing.")
                     send_insights(target_url, "⚠️ Target scraped, but GEMINI_API_KEY is missing for AI digest.")
                     continue
@@ -236,7 +240,6 @@ def run_scraper():
                     """
                     try:
                         raw_response = generate_content_safe(
-                            genai_client,
                             [job_prompt + "\n\nDOM Text:\n" + clean_text]
                         )
                         cleaned_json = raw_response.replace("```json", "").replace("```", "").strip()
@@ -256,7 +259,6 @@ def run_scraper():
                     """
                     try:
                         job_digest = generate_content_safe(
-                            genai_client,
                             [insight_prompt + "\n\nDOM Text:\n" + clean_text]
                         ).strip()
                         send_insights(target_url, job_digest)
@@ -270,7 +272,6 @@ def run_scraper():
                     """
                     try:
                         summary = generate_content_safe(
-                            genai_client,
                             [prompt + "\n\nDOM Text:\n" + clean_text]
                         ).strip()
                         send_insights(target_url, summary)
