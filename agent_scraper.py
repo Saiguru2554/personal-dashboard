@@ -1,5 +1,5 @@
 """
-AI Scraper Agent - Playwright & Direct REST API Engine
+AI Scraper Agent - Playwright & Dynamic REST API Engine
 Fetches target URLs from Apps Script Webhook, restores authenticated browser sessions,
 scrapes dynamic DOM content, extracts structured job/tech insights via Gemini REST API,
 and posts results back to the Personal Command Center dashboard.
@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -19,26 +20,68 @@ APPS_SCRIPT_WEBHOOK = os.environ.get("APPS_SCRIPT_WEBHOOK")
 SESSION_BASE64 = os.environ.get("SESSION_STATE_BASE64")
 
 
+def get_available_models():
+    """
+    Dynamically queries Google's ListModels endpoint to retrieve all active
+    models permitted for this API key that support content generation.
+    """
+    if not GEMINI_API_KEY:
+        return []
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    try:
+        res = requests.get(url, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            available = []
+            for m in data.get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods:
+                    model_name = m.get("name", "").replace("models/", "")
+                    available.append(model_name)
+            
+            # Prioritize standard flash aliases & stable versions first
+            priority_order = [
+                "gemini-flash-latest",
+                "gemini-3.8-flash",
+                "gemini-3.5-flash",
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-flash"
+            ]
+            
+            sorted_models = [m for m in priority_order if m in available]
+            # Append any remaining available models not in the priority list
+            for m in available:
+                if m not in sorted_models and "preview" not in m and "tts" not in m:
+                    sorted_models.append(m)
+                    
+            print(f" Dynamic model discovery found {len(sorted_models)} usable models: {sorted_models[:4]}")
+            return sorted_models
+        else:
+            print(f"⚠️ ListModels HTTP {res.status_code}: {res.text[:100]}")
+    except Exception as e:
+        print(f"⚠️ Failed to dynamically query models: {e}")
+        
+    # Fallback list if ListModels endpoint call fails
+    return ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash"]
+
+
 def generate_content_safe(contents):
     """
-    Direct REST API call to Google's Gemini endpoint using explicit 'models/' URL paths.
+    Generates content using dynamically selected models with automatic retries on 503 high-demand spikes.
     """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is missing.")
 
     prompt_text = contents[0] if isinstance(contents, list) else contents
     
-    # Google REST endpoint requires explicit 'models/' prefix in the URL path
-    models_to_try = [
-        "models/gemini-2.5-flash",
-        "models/gemini-2.0-flash",
-        "models/gemini-1.5-flash"
-    ]
+    # Fetch active models dynamically from user's account
+    models_to_try = get_available_models()
 
     attempt_errors = []
 
-    for model_path in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={GEMINI_API_KEY}"
+    for model_name in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
         headers = {"Content-Type": "application/json"}
         payload = {
             "contents": [{
@@ -46,28 +89,38 @@ def generate_content_safe(contents):
             }]
         }
 
-        try:
-            print(f" Attempting REST API call for URL path: '{model_path}'...")
-            res = requests.post(url, json=payload, headers=headers, timeout=30)
-            
-            if res.status_code == 200:
-                data = res.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                if text:
-                    print(f" Successfully generated content via REST API using: '{model_path}'")
-                    return text
-            else:
-                err_msg = f"{model_path} (HTTP {res.status_code}): {res.text}"
+        # Try up to 3 retries per model for 503 high-demand errors
+        for retry_attempt in range(3):
+            try:
+                print(f" Attempting model '{model_name}' (Attempt {retry_attempt + 1}/3)...")
+                res = requests.post(url, json=payload, headers=headers, timeout=30)
+                
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    if text:
+                        print(f" Successfully generated content using: '{model_name}'")
+                        return text
+                
+                elif res.status_code == 503:
+                    wait_time = (retry_attempt + 1) * 3
+                    print(f"⚠️ Model '{model_name}' high demand (HTTP 503). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                    
+                else:
+                    err_msg = f"{model_name} (HTTP {res.status_code}): {res.text[:120]}"
+                    print(f"⚠️ {err_msg}")
+                    attempt_errors.append(err_msg)
+                    break  # Move to next model if non-503 HTTP error occurs
+                    
+            except Exception as e:
+                err_msg = f"{model_name} Exception: {e}"
                 print(f"⚠️ {err_msg}")
                 attempt_errors.append(err_msg)
-        except Exception as e:
-            err_msg = f"{model_path} Exception: {e}"
-            print(f"⚠️ {err_msg}")
-            attempt_errors.append(err_msg)
-            continue
+                break
 
-    # Return full untruncated error log if all candidates fail
-    raise RuntimeError(" | ".join(attempt_errors))
+    raise RuntimeError("All dynamic model attempts failed: " + " | ".join(attempt_errors[:3]))
 
 
 def sanitize_storage_state(state):
