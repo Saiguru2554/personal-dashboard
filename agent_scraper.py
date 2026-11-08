@@ -10,7 +10,6 @@ import json
 import os
 import sys
 import time
-
 import requests
 from google import genai
 from playwright.sync_api import sync_playwright
@@ -19,6 +18,40 @@ from playwright.sync_api import sync_playwright
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 APPS_SCRIPT_WEBHOOK = os.environ.get("APPS_SCRIPT_WEBHOOK")
 SESSION_BASE64 = os.environ.get("SESSION_STATE_BASE64")
+GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL")
+
+
+def generate_content_safe(client, contents):
+    """
+    Tries primary and fallback Gemini model names sequentially to prevent 404 NOT_FOUND
+    errors caused by model deprecations or API version model string updates.
+    """
+    models_to_try = [
+        GEMINI_MODEL_ENV,
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
+    ]
+    
+    # Filter out empty or duplicate entries while preserving order
+    seen = set()
+    models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
+
+    last_error = None
+    for model_name in models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ Model '{model_name}' failed ({e}). Trying next fallback...")
+            continue
+
+    raise last_error if last_error else RuntimeError("All Gemini models failed.")
 
 
 def sanitize_storage_state(state):
@@ -58,7 +91,6 @@ def restore_session():
         decoded_bytes = base64.b64decode(SESSION_BASE64)
         raw_state = json.loads(decoded_bytes.decode('utf-8'))
         
-        # Sanitize cookie values to prevent Playwright schema crashes
         clean_state = sanitize_storage_state(raw_state)
         
         file_path = "sanitized_state.json"
@@ -197,15 +229,12 @@ def run_scraper():
                       }
                     ]
                     """
-                    response = genai_client.models.generate_content(
-                        model='gemini-1.5-flash',
-                        contents=[job_prompt + "\n\nDOM Text:\n" + clean_text]
-                    )
-                    
-                    raw_response = response.text or ""
-                    cleaned_json = raw_response.replace("```json", "").replace("```", "").strip()
-                    
                     try:
+                        raw_response = generate_content_safe(
+                            genai_client,
+                            [job_prompt + "\n\nDOM Text:\n" + clean_text]
+                        )
+                        cleaned_json = raw_response.replace("```json", "").replace("```", "").strip()
                         jobs = json.loads(cleaned_json)
                         if isinstance(jobs, list):
                             for j in jobs:
@@ -221,12 +250,14 @@ def run_scraper():
                     Summarize the top hiring trends, salary ranges, or active tech role types from this job listing text in 2 concise bullet points.
                     Return plain text only.
                     """
-                    digest_resp = genai_client.models.generate_content(
-                        model='gemini-1.5-flash',
-                        contents=[insight_prompt + "\n\nDOM Text:\n" + clean_text]
-                    )
-                    job_digest = (digest_resp.text or "Job listings extracted successfully.").strip()
-                    send_insights(target_url, job_digest)
+                    try:
+                        job_digest = generate_content_safe(
+                            genai_client,
+                            [insight_prompt + "\n\nDOM Text:\n" + clean_text]
+                        ).strip()
+                        send_insights(target_url, job_digest)
+                    except Exception as err:
+                        send_insights(target_url, f"⚠️ Error during insight generation: {str(err)[:100]}")
 
                 else:
                     # TECH / Events category
@@ -234,12 +265,14 @@ def run_scraper():
                     Summarize the top 3 tech updates, key events, or hiring trends from this text in 2 concise, executive bullet points.
                     Return plain text only.
                     """
-                    response = genai_client.models.generate_content(
-                        model='gemini-1.5-flash',
-                        contents=[prompt + "\n\nDOM Text:\n" + clean_text]
-                    )
-                    summary = (response.text or "No summary generated.").strip()
-                    send_insights(target_url, summary)
+                    try:
+                        summary = generate_content_safe(
+                            genai_client,
+                            [prompt + "\n\nDOM Text:\n" + clean_text]
+                        ).strip()
+                        send_insights(target_url, summary)
+                    except Exception as err:
+                        send_insights(target_url, f"⚠️ Error during summary generation: {str(err)[:100]}")
 
             except Exception as e:
                 print(f" Error scraping target {target_url}: {e}")
