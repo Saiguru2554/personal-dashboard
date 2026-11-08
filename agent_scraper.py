@@ -10,7 +10,6 @@ import json
 import os
 import sys
 import time
-
 import requests
 from google import genai
 from playwright.sync_api import sync_playwright
@@ -21,26 +20,64 @@ APPS_SCRIPT_WEBHOOK = os.environ.get("APPS_SCRIPT_WEBHOOK")
 SESSION_BASE64 = os.environ.get("SESSION_STATE_BASE64")
 GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL")
 
+# Global cache for resolved working model string
+CACHED_WORKING_MODEL = None
+
+
+def resolve_active_model(client):
+    """
+    Dynamically queries Google GenAI API for available models on this API key,
+    selecting the best available flash model to prevent 404 NOT_FOUND errors.
+    """
+    global CACHED_WORKING_MODEL
+    if CACHED_WORKING_MODEL:
+        return CACHED_WORKING_MODEL
+
+    if GEMINI_MODEL_ENV:
+        CACHED_WORKING_MODEL = GEMINI_MODEL_ENV
+        return CACHED_WORKING_MODEL
+
+    # 1. Attempt dynamic model list from API key
+    try:
+        print("🔍 Discovering available models dynamically from Gemini API...")
+        models_pager = client.models.list()
+        available_models = [m.name for m in models_pager if hasattr(m, 'name')]
+        
+        # Look for flash models in order of preference
+        preferred_keywords = ["2.5-flash", "2.0-flash", "flash-latest", "flash"]
+        for kw in preferred_keywords:
+            for model_id in available_models:
+                clean_id = model_id.replace("models/", "")
+                if kw in clean_id and "embedding" not in clean_id:
+                    print(f" Found active model dynamically: '{clean_id}'")
+                    CACHED_WORKING_MODEL = clean_id
+                    return CACHED_WORKING_MODEL
+    except Exception as e:
+        print(f"⚠️ Dynamic model listing skipped/failed ({e}). Using static fallbacks.")
+
+    # 2. Static fallbacks if dynamic listing is restricted
+    static_candidates = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-flash-latest"
+    ]
+    CACHED_WORKING_MODEL = static_candidates[0]
+    return CACHED_WORKING_MODEL
+
 
 def generate_content_safe(client, contents):
     """
-    Tries primary and fallback Gemini model names sequentially to prevent 404 NOT_FOUND
-    errors caused by model deprecations or API version model string updates.
+    Generates content using the dynamically resolved model, with immediate fallbacks
+    if the primary model encounters a generation error.
     """
-    models_to_try = [
-        GEMINI_MODEL_ENV,
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-flash-latest",
-        "gemini-1.5-flash-latest"
-    ]
+    primary_model = resolve_active_model(client)
+    fallback_models = [primary_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
     
-    # Filter out empty or duplicate entries while preserving order
     seen = set()
-    models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
+    models_to_try = [m for m in fallback_models if m and not (m in seen or seen.add(m))]
 
     attempt_errors = []
-    for model_name in models:
+    for model_name in models_to_try:
         try:
             print(f" Attempting generation with model: '{model_name}'...")
             response = client.models.generate_content(
@@ -96,7 +133,6 @@ def restore_session():
     try:
         decoded_bytes = base64.b64decode(SESSION_BASE64)
         raw_state = json.loads(decoded_bytes.decode('utf-8'))
-        
         clean_state = sanitize_storage_state(raw_state)
         
         file_path = "sanitized_state.json"
