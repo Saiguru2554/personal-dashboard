@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+
 import requests
 from google import genai
 from playwright.sync_api import sync_playwright
@@ -30,28 +31,33 @@ def generate_content_safe(client, contents):
         GEMINI_MODEL_ENV,
         "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-1.5-flash"
+        "gemini-flash-latest",
+        "gemini-1.5-flash-latest"
     ]
     
     # Filter out empty or duplicate entries while preserving order
     seen = set()
     models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
 
-    last_error = None
+    attempt_errors = []
     for model_name in models:
         try:
+            print(f" Attempting generation with model: '{model_name}'...")
             response = client.models.generate_content(
                 model=model_name,
                 contents=contents
             )
             if response and response.text:
+                print(f" Successfully generated content using model: '{model_name}'")
                 return response.text
         except Exception as e:
-            last_error = e
-            print(f"⚠️ Model '{model_name}' failed ({e}). Trying next fallback...")
+            err_msg = f"Model '{model_name}' failed: {e}"
+            print(f"⚠️ {err_msg}")
+            attempt_errors.append(err_msg)
             continue
 
-    raise last_error if last_error else RuntimeError("All Gemini models failed.")
+    all_err_summary = " | ".join(attempt_errors[:2])
+    raise RuntimeError(f"All models failed ({all_err_summary})")
 
 
 def sanitize_storage_state(state):
@@ -257,7 +263,7 @@ def run_scraper():
                         ).strip()
                         send_insights(target_url, job_digest)
                     except Exception as err:
-                        send_insights(target_url, f"⚠️ Error during insight generation: {str(err)[:100]}")
+                        send_insights(target_url, f"⚠️ Insight Gen Error: {str(err)[:120]}")
 
                 else:
                     # TECH / Events category
@@ -272,11 +278,11 @@ def run_scraper():
                         ).strip()
                         send_insights(target_url, summary)
                     except Exception as err:
-                        send_insights(target_url, f"⚠️ Error during summary generation: {str(err)[:100]}")
+                        send_insights(target_url, f"⚠️ Summary Gen Error: {str(err)[:120]}")
 
             except Exception as e:
                 print(f" Error scraping target {target_url}: {e}")
-                send_insights(target_url, f"⚠️ Error during execution: {str(e)[:100]}")
+                send_insights(target_url, f"⚠️ Scraper Execution Error: {str(e)[:100]}")
                 continue
 
         browser.close()
