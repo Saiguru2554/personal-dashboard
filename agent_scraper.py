@@ -12,6 +12,7 @@ import sys
 import time
 import requests
 from google import genai
+from google.genai.types import HttpOptions
 from playwright.sync_api import sync_playwright
 
 # Environment Variables fetched from GitHub Secrets
@@ -20,64 +21,24 @@ APPS_SCRIPT_WEBHOOK = os.environ.get("APPS_SCRIPT_WEBHOOK")
 SESSION_BASE64 = os.environ.get("SESSION_STATE_BASE64")
 GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL")
 
-# Global cache for resolved working model string
-CACHED_WORKING_MODEL = None
-
-
-def resolve_active_model(client):
-    """
-    Dynamically queries Google GenAI API for available models on this API key,
-    selecting the best available flash model to prevent 404 NOT_FOUND errors.
-    """
-    global CACHED_WORKING_MODEL
-    if CACHED_WORKING_MODEL:
-        return CACHED_WORKING_MODEL
-
-    if GEMINI_MODEL_ENV:
-        CACHED_WORKING_MODEL = GEMINI_MODEL_ENV
-        return CACHED_WORKING_MODEL
-
-    # 1. Attempt dynamic model list from API key
-    try:
-        print("🔍 Discovering available models dynamically from Gemini API...")
-        models_pager = client.models.list()
-        available_models = [m.name for m in models_pager if hasattr(m, 'name')]
-        
-        # Look for flash models in order of preference
-        preferred_keywords = ["2.5-flash", "2.0-flash", "flash-latest", "flash"]
-        for kw in preferred_keywords:
-            for model_id in available_models:
-                clean_id = model_id.replace("models/", "")
-                if kw in clean_id and "embedding" not in clean_id:
-                    print(f" Found active model dynamically: '{clean_id}'")
-                    CACHED_WORKING_MODEL = clean_id
-                    return CACHED_WORKING_MODEL
-    except Exception as e:
-        print(f"⚠️ Dynamic model listing skipped/failed ({e}). Using static fallbacks.")
-
-    # 2. Static fallbacks if dynamic listing is restricted
-    static_candidates = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-flash-latest"
-    ]
-    CACHED_WORKING_MODEL = static_candidates[0]
-    return CACHED_WORKING_MODEL
-
 
 def generate_content_safe(client, contents):
     """
-    Generates content using the dynamically resolved model, with immediate fallbacks
-    if the primary model encounters a generation error.
+    Tries models against the stable v1 API endpoint to prevent v1beta 404 NOT_FOUND errors.
     """
-    primary_model = resolve_active_model(client)
-    fallback_models = [primary_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+    models_to_try = [
+        GEMINI_MODEL_ENV,
+        "gemini-2.5-flash",
+        "models/gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "models/gemini-2.0-flash"
+    ]
     
     seen = set()
-    models_to_try = [m for m in fallback_models if m and not (m in seen or seen.add(m))]
+    models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
 
     attempt_errors = []
-    for model_name in models_to_try:
+    for model_name in models:
         try:
             print(f" Attempting generation with model: '{model_name}'...")
             response = client.models.generate_content(
@@ -116,7 +77,7 @@ def sanitize_storage_state(state):
         elif raw_same_site in ["none", "no_restriction"]:
             cookie["sameSite"] = "None"
         else:
-            cookie["sameSite"] = "Lax"  # Safe default fallback for null/unspecified
+            cookie["sameSite"] = "Lax"
 
     return state
 
@@ -202,8 +163,13 @@ def run_scraper():
 
     session_file = restore_session()
     
-    # Initialize Gemini client using official Google GenAI SDK
-    genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+    # Force the client to use the stable 'v1' REST endpoint instead of 'v1beta'
+    genai_client = None
+    if GEMINI_API_KEY:
+        genai_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=HttpOptions(api_version="v1")
+        )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -235,13 +201,11 @@ def run_scraper():
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                 
-                # Detect forced auth walls (e.g. LinkedIn guest block)
                 if "authwall" in page.url.lower():
                     print(f"⚠️ Hit anti-bot authwall at {target_url}.")
                     send_insights(target_url, "⚠️ Authwall encountered. Refresh session cookies.")
                     continue
 
-                # Incremental scroll loop to trigger infinite load / AJAX hydration
                 for _ in range(4):
                     page.mouse.wheel(0, 1000)
                     page.wait_for_timeout(1000)
@@ -256,7 +220,6 @@ def run_scraper():
                     continue
 
                 if category == "JOBS":
-                    # 1. Extract job cards for Matched Tech Jobs widget
                     job_prompt = """
                     You are an expert tech recruiter matching job openings.
                     Analyze this raw text extracted from a job search portal and extract up to 5 relevant engineering/tech job listings.
@@ -287,7 +250,6 @@ def run_scraper():
                     except Exception as parse_err:
                         print(f"⚠️ JSON Parsing Error on {target_url}: {parse_err}")
 
-                    # 2. ALSO generate & post an executive digest for AI Agent Insights widget
                     insight_prompt = """
                     Summarize the top hiring trends, salary ranges, or active tech role types from this job listing text in 2 concise bullet points.
                     Return plain text only.
@@ -302,7 +264,6 @@ def run_scraper():
                         send_insights(target_url, f"⚠️ Insight Gen Error: {str(err)[:120]}")
 
                 else:
-                    # TECH / Events category
                     prompt = """
                     Summarize the top 3 tech updates, key events, or hiring trends from this text in 2 concise, executive bullet points.
                     Return plain text only.
