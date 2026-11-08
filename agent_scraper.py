@@ -10,7 +10,6 @@ import json
 import os
 import sys
 import time
-
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -22,23 +21,24 @@ SESSION_BASE64 = os.environ.get("SESSION_STATE_BASE64")
 
 def generate_content_safe(contents):
     """
-    Direct REST API call to Google's Gemini endpoint.
-    Bypasses SDK wrapper issues by executing raw HTTP POST requests.
+    Direct REST API call to Google's Gemini endpoint using explicit 'models/' URL paths.
     """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is missing.")
 
     prompt_text = contents[0] if isinstance(contents, list) else contents
+    
+    # Google REST endpoint requires explicit 'models/' prefix in the URL path
     models_to_try = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash"
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash",
+        "models/gemini-1.5-flash"
     ]
 
     attempt_errors = []
 
-    for model_name in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+    for model_path in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={GEMINI_API_KEY}"
         headers = {"Content-Type": "application/json"}
         payload = {
             "contents": [{
@@ -47,41 +47,37 @@ def generate_content_safe(contents):
         }
 
         try:
-            print(f" Attempting REST API call for model: '{model_name}'...")
+            print(f" Attempting REST API call for URL path: '{model_path}'...")
             res = requests.post(url, json=payload, headers=headers, timeout=30)
             
             if res.status_code == 200:
                 data = res.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 if text:
-                    print(f" Successfully generated content via REST API using: '{model_name}'")
+                    print(f" Successfully generated content via REST API using: '{model_path}'")
                     return text
             else:
-                err_msg = f"Model '{model_name}' HTTP {res.status_code}: {res.text[:150]}"
+                err_msg = f"{model_path} (HTTP {res.status_code}): {res.text}"
                 print(f"⚠️ {err_msg}")
                 attempt_errors.append(err_msg)
         except Exception as e:
-            err_msg = f"Model '{model_name}' request error: {e}"
+            err_msg = f"{model_path} Exception: {e}"
             print(f"⚠️ {err_msg}")
             attempt_errors.append(err_msg)
             continue
 
-    all_err_summary = " | ".join(attempt_errors[:2])
-    raise RuntimeError(f"All REST model attempts failed ({all_err_summary})")
+    # Return full untruncated error log if all candidates fail
+    raise RuntimeError(" | ".join(attempt_errors))
 
 
 def sanitize_storage_state(state):
-    """
-    Sanitizes exported cookie sameSite attributes to conform strictly
-    to Playwright's required schema ('Strict' | 'Lax' | 'None').
-    """
+    """Sanitizes exported cookie sameSite attributes for Playwright schema compliance."""
     if not isinstance(state, dict):
         return state
 
     cookies = state.get("cookies", [])
     for cookie in cookies:
         raw_same_site = str(cookie.get("sameSite", "")).lower().strip()
-        
         if raw_same_site == "strict":
             cookie["sameSite"] = "Strict"
         elif raw_same_site == "lax":
@@ -95,10 +91,7 @@ def sanitize_storage_state(state):
 
 
 def restore_session():
-    """
-    Decodes the Base64 session string, sanitizes cookies, and writes a temporary
-    Playwright-compatible 'sanitized_state.json' file.
-    """
+    """Restores Playwright session state from Base64 string."""
     if not SESSION_BASE64:
         print("No SESSION_STATE_BASE64 secret provided. Running in guest mode.")
         return None
@@ -112,10 +105,10 @@ def restore_session():
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(clean_state, f, indent=2)
             
-        print(" Successfully restored and sanitized authenticated session state.")
+        print(" Successfully restored session state.")
         return file_path
     except Exception as e:
-        print(f"⚠️ Error restoring session state: {e}. Falling back to unauthenticated session.")
+        print(f"⚠️ Error restoring session state: {e}.")
         return None
 
 
@@ -263,7 +256,7 @@ def run_scraper():
                         ).strip()
                         send_insights(target_url, job_digest)
                     except Exception as err:
-                        send_insights(target_url, f"⚠️ Insight Gen Error: {str(err)[:120]}")
+                        send_insights(target_url, f"⚠️ Insight Gen Error: {str(err)}")
 
                 else:
                     prompt = """
@@ -276,11 +269,11 @@ def run_scraper():
                         ).strip()
                         send_insights(target_url, summary)
                     except Exception as err:
-                        send_insights(target_url, f"⚠️ Summary Gen Error: {str(err)[:120]}")
+                        send_insights(target_url, f"⚠️ Summary Gen Error: {str(err)}")
 
             except Exception as e:
                 print(f" Error scraping target {target_url}: {e}")
-                send_insights(target_url, f"⚠️ Scraper Execution Error: {str(e)[:100]}")
+                send_insights(target_url, f"⚠️ Scraper Execution Error: {str(e)}")
                 continue
 
         browser.close()
